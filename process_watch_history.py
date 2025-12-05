@@ -14,6 +14,14 @@ from moviepy.video.io.VideoFileClip import VideoFileClip
 from PIL import Image
 import io
 
+# ============================================================================
+# GEMINI API CONFIGURATION
+# ============================================================================
+# Paste your Gemini API key here:
+GEMINI_API_KEY = "AIzaSyDYmSsoAIRrQyQqs5a8iPimSqjFuIFEooE"
+# Get your free API key at: https://makersuite.google.com/app/apikey
+# ============================================================================
+
 try:
     import pytesseract
     OCR_AVAILABLE = True
@@ -21,18 +29,11 @@ except ImportError:
     OCR_AVAILABLE = False
 
 try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = True
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
 except ImportError:
-    OPENAI_AVAILABLE = False
-
-try:
-    from dotenv import load_dotenv
-    # Load .env file from the script's directory
-    script_dir = Path(__file__).parent.absolute()
-    load_dotenv(dotenv_path=script_dir / '.env')
-except ImportError:
-    pass  # python-dotenv not installed, skip .env loading
+    GEMINI_AVAILABLE = False
+    print("Warning: google-generativeai not installed. Install with: uv pip install google-generativeai")
 
 
 def parse_watch_history(file_path):
@@ -161,65 +162,75 @@ def download_video(url, output_dir='downloads', skip_if_exists=True, max_retries
 
 def analyze_with_llm(transcription, ocr_text, screenshots):
     """
-    Analyze video content using OpenAI's GPT-4 Vision model.
+    Analyze video content using Google's Gemini Pro Vision model.
     Returns structured analysis including description, sentiment, and image description.
     """
-    if not OPENAI_AVAILABLE:
-        print("  Warning: OpenAI not available, using fallback analysis")
+    if not GEMINI_AVAILABLE:
+        print("  Error: google-generativeai not installed. Install with: uv pip install google-generativeai")
         return None
     
-    api_key = os.getenv('OPENAI_API_KEY')
-    if not api_key:
-        print("  Warning: OPENAI_API_KEY not set, using fallback analysis")
-        return None
-    
-    # Debug: Verify API key is loaded
-    if len(api_key) < 20:
-        print(f"  Warning: API key seems invalid (too short: {len(api_key)} chars), using fallback")
+    if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GEMINI_API_KEY_HERE":
+        print("  Error: GEMINI_API_KEY not set. Please set it at the top of the script.")
         return None
     
     try:
-        client = OpenAI(api_key=api_key)
+        # Configure Gemini
+        genai.configure(api_key=GEMINI_API_KEY)
         
-        # Prepare content for API
-        content_parts = []
+        # List available models and find one that supports vision
+        try:
+            available_models = list(genai.list_models())
+            print(f"  Available models: {[m.name for m in available_models[:5]]}")
+            
+            # Look for models that support generateContent (vision capable)
+            vision_model = None
+            # Prefer pro models over flash for better quality
+            for m in available_models:
+                if 'generateContent' in m.supported_generation_methods:
+                    model_name = m.name.split('/')[-1]
+                    # Prefer pro models, then flash
+                    if 'pro' in model_name.lower():
+                        vision_model = model_name
+                        print(f"  Using model: {vision_model}")
+                        break
+            
+            # If no pro model, use flash
+            if not vision_model:
+                for m in available_models:
+                    if 'generateContent' in m.supported_generation_methods:
+                        model_name = m.name.split('/')[-1]
+                        if 'flash' in model_name.lower():
+                            vision_model = model_name
+                            print(f"  Using model: {vision_model}")
+                            break
+            
+            if not vision_model:
+                # Fallback: try common model names
+                for name in ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-pro']:
+                    try:
+                        test_model = genai.GenerativeModel(name)
+                        vision_model = name
+                        print(f"  Using model: {vision_model}")
+                        break
+                    except:
+                        continue
+            
+            if not vision_model:
+                raise Exception("No suitable Gemini model found")
+            
+            model = genai.GenerativeModel(vision_model)
+        except Exception as e:
+            print(f"  Warning: Could not list models: {e}")
+            # Try gemini-1.5-flash as default (most commonly available)
+            print("  Trying gemini-1.5-flash as default...")
+            model = genai.GenerativeModel('gemini-1.5-flash')
         
-        # Add text content
+        # Prepare text content
         text_content = ""
         if transcription and transcription.strip():
             text_content += f"Audio Transcription: {transcription[:2000]}\n\n"
         if ocr_text and ocr_text.strip():
             text_content += f"Text extracted from video frames: {ocr_text[:1000]}\n\n"
-        
-        if text_content:
-            content_parts.append({
-                "type": "text",
-                "text": text_content
-            })
-        
-        # Add screenshots (up to 5)
-        screenshot_count = 0
-        for i, screenshot in enumerate(screenshots[:5]):
-            try:
-                base64_image = image_to_base64(screenshot)
-                content_parts.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:image/jpeg;base64,{base64_image}"
-                    }
-                })
-                screenshot_count += 1
-            except Exception as e:
-                print(f"  Warning: Could not encode screenshot {i}: {e}")
-        
-        # If we have no screenshots but have transcription, still proceed with text-only analysis
-        if screenshot_count == 0 and not text_content:
-            print("  Warning: No screenshots and no transcription text available for LLM analysis")
-            return None
-        
-        if not content_parts:
-            print("  Warning: No content to analyze (no transcription, OCR text, or screenshots)")
-            return None
         
         # Create the prompt
         prompt = """Analyze this TikTok video content and provide a comprehensive analysis in JSON format.
@@ -241,186 +252,152 @@ Provide your analysis as a JSON object with the following structure:
   "image_description": "A brief description of the visual content shown in the video screenshots, including any notable elements, people, objects, scenes, or activities visible"
 }
 
-Be thorough and accurate in your analysis."""
+Be thorough and accurate in your analysis. Return ONLY valid JSON, no other text."""
         
-        content_parts.insert(0, {"type": "text", "text": prompt})
+        # Prepare content parts for Gemini
+        # For gemini-pro-vision, combine text and images in the content list
+        content_parts = []
         
-        # Call OpenAI API
-        response = client.chat.completions.create(
-            model="gpt-4o",  # Using GPT-4o for vision capabilities
-            messages=[
-                {
-                    "role": "user",
-                    "content": content_parts
-                }
-            ],
-            max_tokens=1000,
-            temperature=0.3,
-            response_format={"type": "json_object"}
-        )
+        # Start with prompt
+        if text_content:
+            full_prompt = prompt + "\n\n" + text_content
+        else:
+            full_prompt = prompt
         
-        result_text = response.choices[0].message.content
-        result = json.loads(result_text)
+        content_parts.append(full_prompt)
         
-        return result
+        # Add screenshots (up to 5)
+        screenshot_count = 0
+        for i, screenshot in enumerate(screenshots[:5]):
+            try:
+                content_parts.append(screenshot)
+                screenshot_count += 1
+            except Exception as e:
+                print(f"  Warning: Could not add screenshot {i}: {e}")
         
+        # If we have no screenshots and no text, can't analyze
+        if screenshot_count == 0 and not text_content:
+            print("  Warning: No screenshots and no transcription text available for LLM analysis")
+            return None
+        
+        # Call Gemini API with safety settings configured
+        print(f"  Calling Gemini API with {screenshot_count} screenshots...")
+        
+        # Configure safety settings to be more permissive (needed for video content analysis)
+        safety_settings = [
+            {
+                "category": "HARM_CATEGORY_HARASSMENT",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_HATE_SPEECH",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                "threshold": "BLOCK_NONE"
+            },
+            {
+                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+                "threshold": "BLOCK_NONE"
+            },
+        ]
+        
+        try:
+            response = model.generate_content(
+                content_parts,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.3,
+                    max_output_tokens=2000,  # Increased for longer responses
+                ),
+                safety_settings=safety_settings
+            )
+        except Exception as e:
+            error_str = str(e)
+            if "finish_reason" in error_str or "2" in error_str:
+                print("  Warning: Content was blocked by safety filters. Trying with text-only analysis...")
+                # Retry with text only (no images)
+                if text_content:
+                    try:
+                        text_only_prompt = prompt + "\n\n" + text_content
+                        response = model.generate_content(
+                            text_only_prompt,
+                            generation_config=genai.types.GenerationConfig(
+                                temperature=0.3,
+                                max_output_tokens=2000,
+                            ),
+                            safety_settings=safety_settings
+                        )
+                    except Exception as e2:
+                        raise Exception(f"Text-only analysis also failed: {e2}")
+                else:
+                    raise Exception("Content blocked and no text available for analysis")
+            else:
+                raise
+        
+        # Check finish reason
+        if hasattr(response, 'candidates') and response.candidates:
+            finish_reason = response.candidates[0].finish_reason
+            if finish_reason == 2:  # SAFETY
+                print("  Warning: Response was blocked by safety filters")
+                raise Exception("Content blocked by safety filters")
+            elif finish_reason == 3:  # RECITATION
+                print("  Warning: Response was blocked due to recitation")
+                raise Exception("Content blocked due to recitation")
+        
+        # Extract JSON from response
+        try:
+            result_text = response.text.strip()
+        except Exception as e:
+            if "finish_reason" in str(e) or "Part" in str(e):
+                print("  Error: Response was blocked or incomplete")
+                raise Exception("Response was blocked or incomplete - try with different content")
+            raise
+        
+        # Try to extract JSON if wrapped in markdown code blocks
+        if "```json" in result_text:
+            result_text = result_text.split("```json")[1].split("```")[0].strip()
+        elif "```" in result_text:
+            result_text = result_text.split("```")[1].split("```")[0].strip()
+        
+        # Handle truncated JSON (common issue)
+        if not result_text.endswith('}'):
+            # Try to find the last complete JSON object
+            last_brace = result_text.rfind('}')
+            if last_brace > 0:
+                result_text = result_text[:last_brace + 1]
+            else:
+                # If no closing brace, try to fix common truncation issues
+                if '"description"' in result_text and '"sentiment_analysis"' in result_text:
+                    # Try to complete the JSON
+                    if '"image_description"' not in result_text:
+                        result_text = result_text.rstrip().rstrip(',') + ',\n  "image_description": "Analysis incomplete due to response truncation"\n}'
+                    else:
+                        result_text = result_text.rstrip().rstrip(',') + '\n}'
+        
+        try:
+            result = json.loads(result_text)
+            return result
+        except json.JSONDecodeError as e:
+            print(f"  Warning: JSON parsing failed. Response length: {len(result_text)}")
+            print(f"  Response preview: {result_text[:200]}...")
+            # Try to extract partial data if possible
+            raise Exception(f"Failed to parse JSON response: {e}")
+        
+    except json.JSONDecodeError as e:
+        print(f"  Error: Failed to parse Gemini response as JSON: {e}")
+        print(f"  Response was: {response.text[:200] if 'response' in locals() else 'No response'}")
+        return None
     except Exception as e:
         error_msg = str(e)
-        print(f"  Warning: LLM analysis failed: {error_msg}")
-        # Print more details for debugging
-        if "401" in error_msg or "authentication" in error_msg.lower():
-            print("  Error: Invalid API key. Please check your OPENAI_API_KEY.")
+        print(f"  Error: Gemini API call failed: {error_msg}")
+        if "API_KEY_INVALID" in error_msg or "401" in error_msg:
+            print("  Error: Invalid API key. Please check your GEMINI_API_KEY.")
         elif "429" in error_msg or "rate limit" in error_msg.lower():
             print("  Error: Rate limit exceeded. Please wait and try again.")
-        elif "insufficient_quota" in error_msg.lower():
-            print("  Error: Insufficient quota. Please check your OpenAI account balance.")
+        elif "quota" in error_msg.lower():
+            print("  Error: Quota exceeded. Please check your Gemini API quota.")
         return None
-
-
-def analyze_sentiment_from_context(description, transcription):
-    """
-    Context-aware sentiment analysis based on generated description and transcription context.
-    Uses semantic understanding of the content rather than word-by-word matching.
-    Returns sentiment_label, sentiment_score, confidence, reasoning.
-    """
-    if not description and not transcription:
-        return 'neutral', 0.0, 0.3, "No content available for sentiment analysis."
-    
-    # Combine description and transcription for context
-    context = (description or "") + " " + (transcription or "")
-    context_lower = context.lower()
-    
-    # Context-based sentiment patterns (semantic, not word-by-word)
-    # Positive contexts
-    positive_patterns = [
-        'happy', 'joy', 'excited', 'love', 'amazing', 'wonderful', 'great', 'best',
-        'success', 'win', 'achievement', 'grateful', 'thankful', 'appreciate',
-        'beautiful', 'perfect', 'fantastic', 'brilliant', 'incredible',
-        'funny', 'hilarious', 'entertaining', 'enjoy', 'pleased', 'satisfied'
-    ]
-    
-    # Negative contexts
-    negative_patterns = [
-        'sad', 'angry', 'frustrated', 'disappointed', 'hate', 'terrible', 'awful',
-        'worst', 'bad', 'horrible', 'disgusting', 'problem', 'issue', 'fail',
-        'hurt', 'pain', 'scared', 'afraid', 'worried', 'fear', 'struggle',
-        'difficult', 'hard', 'challenge', 'conflict', 'argument', 'fight'
-    ]
-    
-    # Neutral/educational contexts
-    neutral_patterns = [
-        'tutorial', 'how to', 'explain', 'educational', 'informative', 'review',
-        'discuss', 'share', 'story', 'remember', 'happened', 'music', 'dance'
-    ]
-    
-    # Analyze context semantically
-    pos_context_score = sum(1 for pattern in positive_patterns if pattern in context_lower)
-    neg_context_score = sum(1 for pattern in negative_patterns if pattern in context_lower)
-    neutral_context_score = sum(1 for pattern in neutral_patterns if pattern in context_lower)
-    
-    # Determine sentiment based on context dominance
-    total_context_indicators = pos_context_score + neg_context_score + neutral_context_score
-    
-    if total_context_indicators == 0:
-        # No clear context indicators - default to neutral
-        return 'neutral', 0.0, 0.3, "Content context does not clearly indicate sentiment."
-    
-    # Calculate sentiment based on context ratios
-    if pos_context_score > neg_context_score and pos_context_score > neutral_context_score:
-        sentiment_label = 'positive'
-        # Score based on how dominant positive context is
-        dominance = pos_context_score / max(total_context_indicators, 1)
-        sentiment_score = round(0.3 + (dominance * 0.5), 2)  # Range: 0.3 to 0.8
-        confidence = round(min(0.5 + (pos_context_score / 10), 0.8), 2)
-        reasoning = f"Context analysis indicates positive sentiment based on content themes."
-    elif neg_context_score > pos_context_score and neg_context_score > neutral_context_score:
-        sentiment_label = 'negative'
-        dominance = neg_context_score / max(total_context_indicators, 1)
-        sentiment_score = round(-0.3 - (dominance * 0.5), 2)  # Range: -0.3 to -0.8
-        confidence = round(min(0.5 + (neg_context_score / 10), 0.8), 2)
-        reasoning = f"Context analysis indicates negative sentiment based on content themes."
-    else:
-        # Neutral or mixed
-        sentiment_label = 'neutral'
-        # Slight bias based on pos/neg difference
-        diff = pos_context_score - neg_context_score
-        sentiment_score = round(diff * 0.1, 2)  # Small range: -0.3 to 0.3
-        confidence = round(min(0.4 + (neutral_context_score / 10), 0.7), 2)
-        reasoning = f"Context analysis indicates neutral sentiment or mixed content."
-    
-    return sentiment_label, sentiment_score, confidence, reasoning
-
-
-def generate_context_with_rules(clean_text):
-    """
-    Improved rule-based context generation system as fallback.
-    """
-    if not clean_text or not clean_text.strip():
-        return "No transcript or text content available."
-    
-    text_lower = clean_text.lower()
-    sentences = [s.strip() for s in clean_text.split('.') if s.strip() and len(s.strip()) > 10]
-    
-    if not sentences:
-        # If no sentences, try to create a summary from the text
-        if len(clean_text) > 150:
-            return clean_text[:147] + '...'
-        return clean_text.strip() + '.' if clean_text.strip() else "No transcript available."
-    
-    first_sentence = sentences[0]
-    
-    if len(sentences) == 1:
-        if len(first_sentence) > 200:
-            return first_sentence[:197] + '...'
-        else:
-            return first_sentence + ('.' if not first_sentence.endswith('.') else '')
-    
-    # Pattern matching for different content types
-    if 'dating' in text_lower or 'relationship' in text_lower:
-        if 'standards' in text_lower or 'picky' in text_lower:
-            return "Creator discusses their dating experiences and how their personal growth has raised their standards, making it harder to find compatible partners."
-        else:
-            return "Creator shares thoughts and experiences about dating and relationships."
-    elif 'coffee' in text_lower and 'friend' in text_lower:
-        return "Creator recounts a conversation with a friend, sharing personal reflections and insights."
-    elif 'tutorial' in text_lower or 'how to' in text_lower or 'teach' in text_lower:
-        if 'how to' in text_lower:
-            idx = text_lower.find('how to')
-            topic = clean_text[idx:idx+80].split('.')[0].strip()
-            return f"Educational content explaining {topic}."
-        else:
-            return "Tutorial or educational content providing instructions or guidance."
-    elif 'roast' in text_lower and ('gpt' in text_lower or 'chat' in text_lower):
-        return "Creator uses AI to generate a humorous roast about themselves or someone else."
-    elif 'son' in text_lower and 'girlfriend' in text_lower:
-        return "Parent observes and discusses their son's potential romantic relationship."
-    elif 'communication' in text_lower or 'communicate' in text_lower:
-        if 'pareja' in text_lower or 'relationship' in text_lower:
-            return "Advice about improving communication in romantic relationships."
-        else:
-            return "Content focused on communication skills and interpersonal relationships."
-    elif 'story' in text_lower or 'happened' in text_lower or 'remember' in text_lower:
-        return "Personal storytelling sharing an experience or memory."
-    elif 'dance' in text_lower or 'dancing' in text_lower:
-        return "Dance performance or dance-related content."
-    elif 'music' in text_lower or 'song' in text_lower:
-        return "Music-related content or performance."
-    elif 'review' in text_lower or 'rating' in text_lower:
-        return "Review or opinion about a product, service, or content."
-    else:
-        # Use first sentence or first 150 chars
-        if len(first_sentence) > 150:
-            words = first_sentence.split()
-            summary_words = []
-            char_count = 0
-            for word in words:
-                if char_count + len(word) + 1 > 150:
-                    break
-                summary_words.append(word)
-                char_count += len(word) + 1
-            return ' '.join(summary_words) + '...'
-        else:
-            return first_sentence + ('.' if not first_sentence.endswith('.') else '')
 
 
 def extract_screenshots(video_path, num_frames=5):
@@ -543,33 +520,22 @@ def analyze_video(video_path, whisper_model_instance):
         while len(topics_list) < 5:
             topics_list.append('')
         
-        # Always try LLM analysis first (context-aware)
+        # Analyze using Gemini LLM (required - no fallback)
         llm_analysis = analyze_with_llm(transcription, ocr_text, screenshots)
         
-        # Prepare result with LLM data or context-aware fallbacks
-        if llm_analysis:
-            # Use LLM context matching (preferred method)
-            description = llm_analysis.get('description', '')
-            sentiment_data = llm_analysis.get('sentiment_analysis', {})
-            image_description = llm_analysis.get('image_description', '')
-            
-            sentiment_label = sentiment_data.get('sentiment_label', 'neutral')
-            sentiment_score = sentiment_data.get('sentiment_score', 0.0)
-            sentiment_confidence = sentiment_data.get('confidence', 0.0)
-            sentiment_reasoning = sentiment_data.get('reasoning', '')
-        else:
-            # Fallback: Generate context-aware description first
-            if transcription and transcription.strip():
-                description = generate_context_with_rules(transcription)
-                if len(description) > 200:
-                    description = description[:197] + '...'
-            else:
-                description = 'Silent video with no spoken content or visible text.'
-            
-            # Then analyze sentiment from the context description (not word-by-word)
-            sentiment_label, sentiment_score, sentiment_confidence, sentiment_reasoning = analyze_sentiment_from_context(description, transcription)
-            
-            image_description = 'Visual content analysis not available (LLM analysis failed or API key not set).'
+        if not llm_analysis:
+            print("  Error: LLM analysis failed. Cannot proceed without Gemini API.")
+            return None
+        
+        # Extract LLM analysis results
+        description = llm_analysis.get('description', '')
+        sentiment_data = llm_analysis.get('sentiment_analysis', {})
+        image_description = llm_analysis.get('image_description', '')
+        
+        sentiment_label = sentiment_data.get('sentiment_label', 'neutral')
+        sentiment_score = sentiment_data.get('sentiment_score', 0.0)
+        sentiment_confidence = sentiment_data.get('confidence', 0.0)
+        sentiment_reasoning = sentiment_data.get('reasoning', '')
         
         return {
             'transcription': transcription,
@@ -615,25 +581,25 @@ def main():
         print(f"Error: {history_file} not found")
         sys.exit(1)
     
-    # Check for OpenAI API key and warn if missing
-    api_key = os.getenv('OPENAI_API_KEY')
-    if not api_key:
+    # Check for Gemini API key (required)
+    if not GEMINI_AVAILABLE:
         print("\n" + "="*70)
-        print("WARNING: OPENAI_API_KEY not set!")
+        print("ERROR: google-generativeai not installed!")
         print("="*70)
-        print("The script will use fallback sentiment analysis (less accurate).")
-        print("For better results, set your API key:")
-        print("  export OPENAI_API_KEY='your-api-key-here'")
-        print("  Or create a .env file with: OPENAI_API_KEY=your-key-here")
+        print("Install with: uv pip install google-generativeai")
         print("="*70 + "\n")
-    else:
-        # Verify the key looks valid
-        if len(api_key) < 20:
-            print("\n" + "="*70)
-            print("WARNING: OPENAI_API_KEY appears invalid (too short)")
-            print("="*70 + "\n")
-        else:
-            print(f"✓ OpenAI API key found ({len(api_key)} chars) - will use LLM analysis for better results\n")
+        sys.exit(1)
+    
+    if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_GEMINI_API_KEY_HERE":
+        print("\n" + "="*70)
+        print("ERROR: GEMINI_API_KEY not set!")
+        print("="*70)
+        print("Please set your Gemini API key at the top of process_watch_history.py")
+        print("Get your free API key at: https://makersuite.google.com/app/apikey")
+        print("="*70 + "\n")
+        sys.exit(1)
+    
+    print(f"✓ Gemini API key configured - using Gemini Pro for analysis\n")
     
     print("Parsing watch history...")
     entries = parse_watch_history(history_file)

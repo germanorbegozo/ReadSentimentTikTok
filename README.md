@@ -2,56 +2,48 @@
 
 Analyze TikTok watch history and perform sentiment analysis on video content using AI.
 
-## Quick Start
+For MacOS
 
-1. Initilize the virtual environment and install the dependencies:
+1. Initialize the virtual environment and install the dependencies:
 
-   ```bas
+   ```bash
    uv venv
    ```
    
-   ```bas
-   uv pip install 
+   ```bash
+   source .venv/bin/activate
    ```
 
-   ```bas
+   ```bash
    uv pip install pip
    ```
 
-   ```bas
+   ```bash
    uv pip install -r requirements.txt
    ```
 
-2. **Set OpenAI API key (optional but recommended):**
-   
-   Create a `.env` file in the project root:
-   ```bash
-   echo 'OPENAI_API_KEY=sk-your-key-here' > .env
-   ```
-   
-   Or set it temporarily:
-   ```bash
-   export OPENAI_API_KEY="sk-your-key-here"
-   ```
-   
-   **Get a free API key:** Sign up at [platform.openai.com](https://platform.openai.com) - new accounts get $5 free credits.
+2. Set Gemini API key
+    
+    Open `process_watch_history.py` and set your API key at the top of the file:
+    ```python
+    GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"
+    ```
+    
+    **Get a free API key:** Sign up at [makersuite.google.com/app/apikey](https://makersuite.google.com/app/apikey)
 
 3. **Run the analysis:**
    ```bash
    uv run process_watch_history.py
    ```
 
-## Requirements
+Requirements
 
 - Python 3.8+
 - FFmpeg
-- OpenAI API key (optional - script works without it using fallback analysis)
+- Gemini API key (required - set in process_watch_history.py)
 - TikTok watch history export in `data/Watch History.txt`
 
-## Output
+Output
 
 Results are saved to `watch_history_analysis.csv`. Videos are downloaded to `downloads/` (skips already downloaded files).
 
-## Note
-
-The script works **without an API key** using context-aware fallback analysis, but LLM analysis provides more accurate sentiment detection and better descriptions.
